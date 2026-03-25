@@ -1,0 +1,12 @@
+model*/
+lora-adapter/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+__pycache__/
+*.pyc
+.DS_Store
+mlx-env/
+*.tar
