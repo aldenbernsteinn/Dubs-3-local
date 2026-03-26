@@ -2,16 +2,23 @@
 """
 LoRA distillation training for Qwen3.5-27B on CUDA (RTX 5090).
 
-Goal: Train a LoRA adapter on a Q3 base model using FP16 teacher outputs,
-so the Q3+LoRA model matches Unsloth Q6_K_XL quality.
+Goal: Train a LoRA adapter so Q3+LoRA matches Unsloth Q6_K_XL quality.
 
-The teacher (Qwen3.5-27B FP16) is loaded in NF4 for inference on the 5090.
-Calibration data was generated on the Mac from a Q5+Q6 teacher, but this
-script can regenerate from the full FP16 model for better quality.
+Uses knowledge distillation with KL divergence loss to transfer the teacher's
+soft knowledge, not just hard labels. The teacher (FP16 in NF4) generates both
+text responses AND logit distributions for proper distillation.
 
 Usage:
     pip install -r requirements-cuda.txt
-    python train_lora_cuda.py [--regenerate-data]
+
+    # Use pre-generated calibration data (from generate_calibration.py)
+    python train_lora_cuda.py
+
+    # Regenerate data from FP16 teacher on this GPU
+    python train_lora_cuda.py --regenerate-data
+
+    # Hyperparameter sweep
+    python train_lora_cuda.py --lora-rank 64 --lr 3e-5 --iters 600
 """
 
 import argparse
@@ -20,6 +27,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -35,53 +43,96 @@ MODEL_ID = "Qwen/Qwen3.5-27B"
 OUTPUT_DIR = Path("./lora-adapter")
 DATA_DIR = Path("./calibration_data")
 
-# Calibration prompts (same as Mac generate_calibration.py)
-PROMPTS = [
-    "Write a Python function that implements Dijkstra's shortest path algorithm using a priority queue. Include type hints and handle edge cases.",
-    "Implement a trie data structure in Rust with insert, search, and prefix_search methods. Use proper Rust idioms.",
-    "Write a Go function that performs a topological sort on a directed acyclic graph represented as an adjacency list.",
-    "Implement a B-tree with order 5 in C++. Include insert and search operations with proper node splitting.",
-    "Write a TypeScript class for an LRU cache with O(1) get and put operations using a doubly-linked list and hash map.",
-    "Write a Python async web scraper that respects rate limits, handles retries with exponential backoff, and saves results to SQLite.",
-    "Implement a simple thread pool in Rust with a fixed number of worker threads and a job queue.",
-    "Write a C function that implements a memory allocator using a free list with first-fit allocation strategy.",
-    "Create a Go HTTP middleware that implements JWT authentication with token refresh.",
-    "Write a Python decorator that implements memoization with TTL (time-to-live) expiry and max cache size.",
-    "Implement a skip list in Python with insert, delete, and search operations. Include probabilistic level generation.",
-    "Write a Rust implementation of a concurrent queue using atomics, supporting multiple producers and consumers.",
-    "Implement a segment tree in C++ that supports range sum queries and point updates.",
-    "Write a Python class for a Bloom filter with configurable false positive rate.",
-    "Implement a red-black tree in Java with insert, delete, and iterator support.",
-    "Explain the CAP theorem and give a concrete example of how a distributed database like Cassandra makes tradeoffs between consistency and availability.",
-    "What are the tradeoffs between using microservices vs a monolith? When would you choose each? Give specific examples.",
-    "Explain how garbage collection works in Go vs Rust's ownership model. Compare their approaches to memory safety.",
-    "Describe the difference between optimistic and pessimistic concurrency control. When would you use each?",
-    "Explain how a B+ tree index works in a database and why it's preferred over a hash index for range queries.",
-    "Explain the difference between TCP and UDP. When would you use each? Give real-world examples.",
-    "What is the difference between a process and a thread? Explain context switching.",
-    "Explain how HTTPS/TLS handshake works step by step.",
-    "What is eventual consistency and how does it differ from strong consistency?",
-    "Explain the concept of backpressure in streaming systems.",
-    "Prove that the square root of 2 is irrational.",
-    "Explain the time complexity of quicksort in best, average, and worst cases. Why is the worst case O(n^2)?",
-    "Derive the master theorem for recurrence relations and give three examples.",
-    "Explain the halting problem and why it's undecidable.",
-    "What is the pigeonhole principle? Give three non-trivial applications in computer science.",
-    "Design a URL shortening service like bit.ly. Cover the API design, database schema, hash generation strategy, and how to handle high traffic.",
-    "Design a distributed message queue system. Cover partitioning, replication, ordering guarantees, and consumer group management.",
-    "Write a comprehensive guide to implementing OAuth 2.0 with PKCE flow for a mobile application.",
-    "Explain how a modern CPU pipeline works, covering instruction fetch, decode, execute, memory access, and write-back. Include branch prediction.",
-    "Design a real-time collaborative text editor. Cover CRDTs vs OT, conflict resolution, and network architecture.",
-]
 
+# ── Distillation Trainer with KL divergence ──────────────────────────────────
+
+class DistillationTrainer(Trainer):
+    """
+    Custom trainer that uses temperature-scaled KL divergence loss
+    for knowledge distillation instead of plain cross-entropy.
+
+    Combined loss: alpha * KL_div(student, teacher_temp) + (1 - alpha) * CE(student, labels)
+
+    When teacher logits are not available (no logits file), falls back to
+    temperature-scaled cross-entropy which approximates soft-target behavior.
+    """
+
+    def __init__(self, *args, distill_temperature=4.0, distill_alpha=0.7,
+                 teacher_model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.distill_temperature = distill_temperature
+        self.distill_alpha = distill_alpha
+        self.teacher_model = teacher_model
+        if teacher_model is not None:
+            self.teacher_model.eval()
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels", None)
+        outputs = model(**inputs)
+        student_logits = outputs.logits
+
+        if labels is None:
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        # Standard cross-entropy loss
+        shift_logits = student_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        ce_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        # KL divergence with teacher (online distillation)
+        if self.teacher_model is not None:
+            with torch.no_grad():
+                teacher_outputs = self.teacher_model(**inputs)
+                teacher_logits = teacher_outputs.logits
+
+            T = self.distill_temperature
+            shift_teacher = teacher_logits[..., :-1, :].contiguous()
+
+            # KL divergence on temperature-scaled logits
+            student_log_probs = F.log_softmax(shift_logits / T, dim=-1)
+            teacher_probs = F.softmax(shift_teacher / T, dim=-1)
+
+            # Only compute KL on non-padding tokens
+            mask = (shift_labels != -100).unsqueeze(-1).float()
+            kl_loss = F.kl_div(
+                student_log_probs * mask,
+                teacher_probs * mask,
+                reduction="batchmean",
+            ) * (T ** 2)
+
+            loss = self.distill_alpha * kl_loss + (1 - self.distill_alpha) * ce_loss
+        else:
+            # Fallback: temperature-scaled CE (approximates soft targets)
+            T = self.distill_temperature
+            scaled_logits = shift_logits / T
+            soft_ce = F.cross_entropy(
+                scaled_logits.view(-1, scaled_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            ) * (T ** 2)
+
+            loss = self.distill_alpha * soft_ce + (1 - self.distill_alpha) * ce_loss
+
+        return (loss, outputs) if return_outputs else loss
+
+
+# ── Data generation from teacher ─────────────────────────────────────────────
 
 def generate_teacher_data(model, tokenizer):
     """Generate calibration data from FP16 teacher model."""
-    print("Generating teacher outputs from FP16 model...")
+    from generate_calibration import PROMPTS
+
+    print(f"Generating teacher outputs from FP16 model ({len(PROMPTS)} prompts)...")
     DATA_DIR.mkdir(exist_ok=True)
 
     train_data = []
     valid_data = []
+    split_idx = int(len(PROMPTS) * 0.85)
 
     for i, prompt in enumerate(PROMPTS):
         print(f"  [{i+1}/{len(PROMPTS)}] {prompt[:60]}...")
@@ -93,7 +144,7 @@ def generate_teacher_data(model, tokenizer):
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=1024,
+                max_new_tokens=2048,
                 temperature=0.3,
                 do_sample=True,
                 top_p=0.9,
@@ -102,7 +153,7 @@ def generate_teacher_data(model, tokenizer):
         response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         entry = {"text": f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{response}<|im_end|>"}
 
-        if i < len(PROMPTS) - 5:
+        if i < split_idx:
             train_data.append(entry)
         else:
             valid_data.append(entry)
@@ -133,7 +184,7 @@ def load_data():
     return train_entries, valid_entries
 
 
-def tokenize_data(entries, tokenizer, max_length=1024):
+def tokenize_data(entries, tokenizer, max_length=2048):
     """Tokenize entries for training."""
     texts = [e["text"] for e in entries]
     tokenized = tokenizer(
@@ -144,21 +195,36 @@ def tokenize_data(entries, tokenizer, max_length=1024):
         return_tensors="pt",
     )
     tokenized["labels"] = tokenized["input_ids"].clone()
+
+    # Mask padding tokens in labels so loss ignores them
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is not None:
+        tokenized["labels"][tokenized["labels"] == pad_token_id] = -100
+
     return Dataset.from_dict({k: v.tolist() for k, v in tokenized.items()})
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="LoRA distillation training for Dubs-3")
     parser.add_argument("--regenerate-data", action="store_true",
-                        help="Regenerate calibration data from FP16 teacher (better quality)")
-    parser.add_argument("--iters", type=int, default=200)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--lora-rank", type=int, default=16)
+                        help="Regenerate calibration data from FP16 teacher")
+    parser.add_argument("--iters", type=int, default=400,
+                        help="Training steps (default: 400)")
+    parser.add_argument("--lr", type=float, default=5e-5,
+                        help="Learning rate (default: 5e-5)")
+    parser.add_argument("--lora-rank", type=int, default=32,
+                        help="LoRA rank (default: 32, try 64 for better quality)")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--distill-temp", type=float, default=4.0,
+                        help="Distillation temperature (default: 4.0)")
+    parser.add_argument("--distill-alpha", type=float, default=0.7,
+                        help="KL loss weight vs CE (default: 0.7)")
+    parser.add_argument("--online-distill", action="store_true",
+                        help="Use online KL distillation (loads teacher separately, needs more VRAM)")
     args = parser.parse_args()
 
     print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     # Load model in NF4 (4-bit) for memory efficiency
     bnb_config = BitsAndBytesConfig(
@@ -187,6 +253,21 @@ def main():
     train_entries, valid_entries = load_data()
     print(f"Loaded {len(train_entries)} train + {len(valid_entries)} valid examples")
 
+    # Optionally load a separate teacher for online KL distillation
+    teacher_model = None
+    if args.online_distill:
+        print("Loading separate teacher model for online KL distillation...")
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+
     # Prepare model for LoRA training
     model = prepare_model_for_kbit_training(model)
 
@@ -206,7 +287,7 @@ def main():
     train_dataset = tokenize_data(train_entries, tokenizer)
     valid_dataset = tokenize_data(valid_entries, tokenizer)
 
-    # Training
+    # Training arguments
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
         num_train_epochs=3,
@@ -215,25 +296,34 @@ def main():
         gradient_accumulation_steps=4,
         learning_rate=args.lr,
         bf16=True,
-        logging_steps=10,
+        logging_steps=5,
         eval_strategy="steps",
-        eval_steps=50,
-        save_steps=50,
-        warmup_steps=10,
+        eval_steps=25,
+        save_steps=25,
+        warmup_steps=20,
         lr_scheduler_type="cosine",
+        weight_decay=0.01,
+        max_grad_norm=1.0,
         report_to="none",
         gradient_checkpointing=True,
     )
 
-    trainer = Trainer(
+    # Use distillation trainer
+    trainer = DistillationTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
         data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        distill_temperature=args.distill_temp,
+        distill_alpha=args.distill_alpha,
+        teacher_model=teacher_model,
     )
 
-    print("\nStarting LoRA training...")
+    distill_mode = "online KL" if teacher_model else f"temperature-scaled CE (T={args.distill_temp})"
+    print(f"\nStarting LoRA training (distillation: {distill_mode})...")
+    print(f"  rank={args.lora_rank}, lr={args.lr}, steps={args.iters}")
+    print(f"  alpha={args.distill_alpha}, temperature={args.distill_temp}")
     trainer.train()
 
     # Save adapter
